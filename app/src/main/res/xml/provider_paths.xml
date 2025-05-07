@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 定义应用缓存目录中的 "apk_downloads" 子目录可以被 FileProvider 共享 -->
+    <!-- 你可以根据你实际存储 APK 的路径来修改 path -->
+    <cache-path name="apk_downloads" path="apk_downloads/" />
+    <!-- 如果你下载到 files 目录: -->
+    <!-- <files-path name="apk_downloads" path="apk_downloads/" /> -->
+</paths>
