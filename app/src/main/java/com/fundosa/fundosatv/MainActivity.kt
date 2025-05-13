@@ -1,83 +1,175 @@
 package com.fundosa.fundosatv // 确保包名与你的项目一致
 
-import android.app.DownloadManager
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.PackageManager
-import android.net.Uri
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.ImageView
-import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog // 建议使用 AppCompatAlertDialog 以获得更好的样式
-import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import com.bumptech.glide.Glide
+import com.bumptech.glide.load.engine.DiskCacheStrategy
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope // 注意：对于更复杂的应用，建议使用 lifecycle-aware coroutine scopes
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONObject
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.IOException
 
 class MainActivity : FragmentActivity() {
 
-    // !!! 重要：请将下面的 URL 替换为你公司图片的真实网络地址 !!!
-    private val imageUrl = "https://www.fundosa.com/img/fundosaTV/public/TV1.jpg"
-
-    // !!! 重要：请将下面的 URL 替换为你的版本信息文件的真实网络地址 !!!
-    private val versionInfoUrl = "http://www.fundosa.com/updates/version_info.json"
-
+    // ImageView 控件，声明为 lateinit，在 onCreate 中初始化
     private lateinit var imageViewDisplay: ImageView
-    private var downloadId: Long = -1L
-    private var newApkPath: String? = null
-    private lateinit var downloadCompleteReceiver: BroadcastReceiver
 
-    // 用于处理“安装未知应用”权限请求的结果
-    private val requestInstallPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { _ -> // result not directly used here, we re-check
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (packageManager.canRequestPackageInstalls()) {
-                    newApkPath?.let { installApk(it) } // 权限已授予，尝试安装
-                } else {
-                    Toast.makeText(this, "更新失败：未授予安装应用权限", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
+    companion object {
+        private const val PREFS_NAME = "fundosa_tv_prefs"
+        private const val KEY_LOCAL_IMAGE_VERSION = "local_image_version"
+        // !!! 请确保这里的 URL 是你的版本日志文件的真实可访问 URL !!!
+        private const val IMAGE_VERSION_LOG_URL = "https://www.fundosa.com/fundosaTV/img/version.json"
+        // !!! 默认图片 URL，当版本日志不可用或日志中未指定 URL 时使用 !!!
+        private const val DEFAULT_IMAGE_URL = "https://www.fundosa.com/fundosaTV/img/spare.jpg"
+        private const val TAG = "MainActivityFundosa" // 日志标签
+    }
+
+    private lateinit var sharedPreferences: SharedPreferences
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 1. 设置全屏
         hideSystemUI()
+
+        // 2. 设置布局文件
         setContentView(R.layout.activity_main)
 
+        // 3. 初始化 ImageView 控件
         imageViewDisplay = findViewById(R.id.imageView) // 确保 ID 与 XML 中的一致
 
-        loadAndDisplayImage() // 加载图片
-        checkForUpdates()     // 检查更新
+        // 4. 初始化 SharedPreferences
+        sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // 5. 启动协程检查并更新图片
+        lifecycleScope.launch {
+            checkAndUpdateImages()
+        }
     }
 
-    private fun loadAndDisplayImage() {
-        if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
-            Glide.with(this)
-                .load(imageUrl)
-                .placeholder(android.R.drawable.screen_background_light)
-                .error(R.drawable.spare) // 你指定的备用图片
-                .into(imageViewDisplay)
-        } else {
-            imageViewDisplay.setImageResource(R.drawable.spare) // URL 无效时也显示备用图片
+    private suspend fun checkAndUpdateImages() {
+        val localVersion = getLocalImageVersion()
+        var serverImageUrl = DEFAULT_IMAGE_URL // 默认为 DEFAULT_IMAGE_URL
+        var serverVersion = localVersion // 默认为本地版本，防止网络请求失败
+
+        Log.d(TAG, "Starting image version check. Local version: $localVersion")
+
+        try {
+            val versionJsonString = fetchVersionLog() // 这是一个挂起函数
+            if (versionJsonString != null) {
+                Log.d(TAG, "Fetched version log: $versionJsonString")
+                val jsonObject = JSONObject(versionJsonString)
+                serverVersion = jsonObject.optString("currentImageVersion", localVersion ?: "unknown") // 如果本地版本为null，提供一个默认值
+                // 从JSON中获取图片URL，如果不存在，则使用DEFAULT_IMAGE_URL
+                serverImageUrl = jsonObject.optString("imageUrl", DEFAULT_IMAGE_URL)
+                if (serverImageUrl.isEmpty()) { // 以防 "imageUrl": "" 的情况
+                    serverImageUrl = DEFAULT_IMAGE_URL
+                }
+                Log.d(TAG, "Parsed server version: $serverVersion, Server image URL: $serverImageUrl")
+            } else {
+                Log.w(TAG, "Failed to fetch version log, using default image URL and local version.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching or parsing version log. Using default image URL.", e)
+            // 网络错误或解析错误，使用默认图片URL和之前的本地版本（或触发更新如果本地版本为空）
         }
+
+        // 条件判断逻辑：
+        // 1. 本地版本为空 (首次启动或清除缓存后) -> 需要加载
+        // 2. 服务器版本与本地版本不同 -> 需要更新
+        if (localVersion == null || serverVersion != localVersion) {
+            Log.i(TAG, "New image version detected ('$serverVersion') or first run. Updating image from: $serverImageUrl")
+            loadImageWithGlide(serverImageUrl, serverVersion) // 使用从服务器获取的或默认的 URL
+            if (serverVersion != localVersion) { // 只有当版本确实变化时才保存，避免首次启动localVersion为null时错误保存
+                saveLocalImageVersion(serverVersion.toString())
+            }
+        } else {
+            Log.i(TAG, "Image version ('$localVersion') is up to date. Loading image from: $serverImageUrl")
+            // 版本相同，也加载一次图片（确保图片已显示），使用本地版本号和服务器（或默认）图片URL
+            // 这样可以确保即使没有版本变化，图片也会被加载（例如，应用被杀死后重启）
+            loadImageWithGlide(serverImageUrl, localVersion)
+        }
+    }
+
+    private suspend fun fetchVersionLog(): String? {
+        return withContext(Dispatchers.IO) { // 切换到 IO 线程执行网络请求
+            val client = OkHttpClient()
+            val request = Request.Builder()
+                .url(IMAGE_VERSION_LOG_URL)
+                .header("Cache-Control", "no-cache, no-store, must-revalidate") // 强制不缓存版本文件本身
+                .header("Pragma", "no-cache")
+                .header("Expires", "0")
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        response.body?.string()
+                    } else {
+                        Log.e(TAG, "Failed to fetch version log, response code: ${response.code}")
+                        null
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e(TAG, "Network error fetching version log", e)
+                null
+            }
+        }
+    }
+
+    private fun saveLocalImageVersion(version: String) {
+        sharedPreferences.edit().putString(KEY_LOCAL_IMAGE_VERSION, version).apply()
+        Log.d(TAG, "Saved local image version: $version")
+    }
+
+    private fun getLocalImageVersion(): String? {
+        val version = sharedPreferences.getString(KEY_LOCAL_IMAGE_VERSION, null)
+        Log.d(TAG, "Retrieved local image version: $version")
+        return version
+    }
+
+    private fun loadImageWithGlide(baseUrl: String, version: String?) {
+        // 确保 Activity 仍然有效
+        if (isDestroyed || isFinishing) {
+            Log.w(TAG, "Activity is finishing or destroyed, skipping Glide load.")
+            return
+        }
+
+        // 通过在 URL 后附加版本号作为查询参数，让 Glide 将其视为不同的 URL
+        // 这样，当版本号改变时，Glide 会重新下载图片而不是使用旧缓存
+        val imageUrlWithVersion = if (version != null && version != "unknown" && baseUrl.startsWith("http")) {
+            // 只有当 version 有效且 baseUrl 是网络路径时才添加版本参数
+            if (baseUrl.contains("?")) "$baseUrl&v=$version" else "$baseUrl?v=$version"
+        } else {
+            baseUrl // 如果没有版本号，或不是有效版本，或不是网络图片，使用基础 URL
+        }
+
+        Log.d(TAG, "Glide loading image from: $imageUrlWithVersion")
+
+        Glide.with(this)
+            .load(imageUrlWithVersion)
+            .placeholder(R.drawable.spare) // 加载时的占位图 (你的备用图)
+            .error(R.drawable.spare)       // 加载失败时显示的图片 (你的备用图)
+            .diskCacheStrategy(DiskCacheStrategy.AUTOMATIC) // 自动选择缓存策略，通常是 RESOURCE 或 DATA
+            // DiskCacheStrategy.NONE - 完全不缓存到磁盘
+            // DiskCacheStrategy.DATA - 只缓存原始下载数据
+            // DiskCacheStrategy.RESOURCE - 只缓存解码后的资源
+            // DiskCacheStrategy.ALL - 缓存所有版本（源数据和解码后数据）
+            // DiskCacheStrategy.AUTOMATIC - Glide 自动选择
+            // 对于版本控制的 URL，AUTOMATIC 通常意味着如果 URL 变了，它会重新下载。
+            .skipMemoryCache(false) // 是否跳过内存缓存，通常设为 false 以获得更好性能
+            .into(imageViewDisplay)
     }
 
     private fun hideSystemUI() {
@@ -97,226 +189,5 @@ class MainActivity : FragmentActivity() {
                             or View.SYSTEM_UI_FLAG_FULLSCREEN
                     )
         }
-    }
-
-    private fun getCurrentVersionCode(): Long {
-        return try {
-            val packageInfo = packageManager.getPackageInfo(packageName, 0)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                packageInfo.longVersionCode
-            } else {
-                @Suppress("DEPRECATION")
-                packageInfo.versionCode.toLong()
-            }
-        } catch (e: PackageManager.NameNotFoundException) {
-            e.printStackTrace()
-            -1L // 发生错误时返回一个无效值
-        }
-    }
-
-    private fun checkForUpdates() {
-        GlobalScope.launch(Dispatchers.IO) { // 在后台线程执行网络请求
-            try {
-                Log.d("UpdateCheck", "开始检查更新，URL: $versionInfoUrl")
-                val url = URL(versionInfoUrl)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "GET"
-                connection.connectTimeout = 10000 // 10秒连接超时
-                connection.readTimeout = 10000    // 10秒读取超时
-
-                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                    val inputStream = connection.inputStream
-                    val response = inputStream.bufferedReader().use { it.readText() }
-                    Log.d("UpdateCheck", "服务器版本信息: $response")
-                    val json = JSONObject(response)
-
-                    val latestVersionCode = json.getLong("latestVersionCode")
-                    val apkUrl = json.getString("apkUrl")
-                    val releaseNotes = json.optString("releaseNotes", "发现新版本，建议更新！") // 可选的更新日志
-
-                    val currentVersionCode = getCurrentVersionCode()
-                    Log.d("UpdateCheck", "当前版本: $currentVersionCode, 最新版本: $latestVersionCode")
-
-                    if (latestVersionCode > currentVersionCode) {
-                        withContext(Dispatchers.Main) { // 切换回主线程显示对话框
-                            showUpdateDialog(apkUrl, latestVersionCode.toString(), releaseNotes)
-                        }
-                    } else {
-                        Log.d("UpdateCheck", "当前已是最新版本")
-                        // 你可以在这里选择性地用 Toast 提示用户已是最新版本
-                        // withContext(Dispatchers.Main) {
-                        //     Toast.makeText(this@MainActivity, "当前已是最新版本", Toast.LENGTH_SHORT).show()
-                        // }
-                    }
-                } else {
-                    Log.e("UpdateCheck", "检查更新失败，服务器响应码: ${connection.responseCode}")
-                    // withContext(Dispatchers.Main) {
-                    //     Toast.makeText(this@MainActivity, "检查更新失败: ${connection.responseCode}", Toast.LENGTH_LONG).show()
-                    // }
-                }
-                connection.disconnect()
-            } catch (e: Exception) {
-                Log.e("UpdateCheck", "检查更新异常: ${e.message}", e)
-                // withContext(Dispatchers.Main) {
-                //    Toast.makeText(this@MainActivity, "检查更新异常: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
-                // }
-            }
-        }
-    }
-
-    private fun showUpdateDialog(apkUrl: String, newVersionName: String, releaseNotes: String) {
-        AlertDialog.Builder(this)
-            .setTitle("发现新版本 $newVersionName")
-            .setMessage(releaseNotes)
-            .setPositiveButton("立即更新") { dialog, _ ->
-                downloadAndInstallApk(apkUrl)
-                dialog.dismiss()
-            }
-            .setNegativeButton("暂不更新") { dialog, _ ->
-                dialog.dismiss()
-            }
-            .setCancelable(false) // 可以根据需要设置为 true 或 false
-            .show()
-    }
-
-    private fun downloadAndInstallApk(apkUrl: String) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!packageManager.canRequestPackageInstalls()) {
-                promptToAllowInstallUnknownApps()
-                // 将apkUrl暂存，以便在用户授予权限后继续下载
-                // 这里的逻辑可以优化，比如先提示，用户同意后再下载，或者下载后提示权限
-                // 为了简化，我们先请求权限，如果权限通过，后续的 installApk 会直接安装
-                // 如果你希望在权限授予后自动开始下载，需要更复杂的逻辑
-                newApkPath = null // 清除旧路径，因为我们还没下载
-                Toast.makeText(this, "请先允许安装未知应用权限后再尝试更新", Toast.LENGTH_LONG).show()
-                return // 暂时返回，等待用户操作权限设置
-            }
-        }
-
-        Toast.makeText(this, "开始下载更新...", Toast.LENGTH_SHORT).show()
-        val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val request = DownloadManager.Request(Uri.parse(apkUrl))
-            .setTitle("应用更新")
-            .setDescription("正在下载新版本 FundosaTV...")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "FundosaTV_update.apk")
-            // 或者使用缓存目录，这样卸载应用时会被清除
-            // .setDestinationInExternalCacheDir(this, "apk_downloads/FundosaTV_update.apk")
-            .setMimeType("application/vnd.android.package-archive")
-            .setAllowedOverMetered(true) // 允许在计费网络下载
-            .setAllowedOverRoaming(true) // 允许在漫游网络下载
-
-        downloadId = downloadManager.enqueue(request)
-
-        // 注册广播接收器以监听下载完成
-        registerDownloadReceiver()
-    }
-
-    private fun promptToAllowInstallUnknownApps() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-            intent.data = Uri.parse("package:$packageName")
-            try {
-                requestInstallPermissionLauncher.launch(intent) // 使用 ActivityResultLauncher
-            } catch (e: Exception) {
-                Log.e("InstallPermission", "无法启动安装未知应用设置", e)
-                Toast.makeText(this, "无法打开权限设置页面", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    private fun registerDownloadReceiver() {
-        downloadCompleteReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
-                if (id == downloadId) {
-                    val query = DownloadManager.Query().setFilterById(id)
-                    val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                    val cursor = downloadManager.query(query)
-                    if (cursor.moveToFirst()) {
-                        val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-                        val status = cursor.getInt(statusIndex)
-                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                            val uriIndex = cursor.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
-                            val downloadedApkUriString = cursor.getString(uriIndex)
-                            if (downloadedApkUriString != null) {
-                                val downloadedApkUri = Uri.parse(downloadedApkUriString)
-                                // 从 content URI 获取真实文件路径
-                                // 对于 DownloadManager 下载到 ExternalFilesDir 的文件，可以直接从 URI 获取 path
-                                val file = File(Uri.parse(downloadedApkUriString).path!!) // 假设uri格式为 file:///...
-                                newApkPath = file.absolutePath
-                                Log.d("Download", "APK 下载成功，路径: $newApkPath")
-                                installApk(newApkPath!!)
-                            } else {
-                                Toast.makeText(this@MainActivity, "下载成功但无法获取文件路径", Toast.LENGTH_LONG).show()
-                            }
-                        } else {
-                            val reasonIndex = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
-                            val reason = cursor.getInt(reasonIndex)
-                            Log.e("Download", "下载失败，状态: $status, 原因: $reason")
-                            Toast.makeText(this@MainActivity, "下载更新失败，原因代码: $reason", Toast.LENGTH_LONG).show()
-                        }
-                    }
-                    cursor.close()
-                    unregisterReceiver(this) // 下载完成或失败后注销接收器
-                }
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(downloadCompleteReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(downloadCompleteReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE))
-        }
-    }
-
-
-    private fun installApk(apkPath: String) {
-        val apkFile = File(apkPath)
-        if (!apkFile.exists()) {
-            Toast.makeText(this, "APK 文件不存在: $apkPath", Toast.LENGTH_LONG).show()
-            Log.e("InstallApk", "APK 文件不存在: $apkPath")
-            return
-        }
-
-        // 再次检查安装权限 (Android 8.0+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!packageManager.canRequestPackageInstalls()) {
-                promptToAllowInstallUnknownApps() // 如果还没有权限，再次提示
-                return
-            }
-        }
-
-        val intent = Intent(Intent.ACTION_VIEW)
-        val apkUri: Uri
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            apkUri = FileProvider.getUriForFile(this, "${applicationContext.packageName}.provider", apkFile)
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } else {
-            apkUri = Uri.fromFile(apkFile)
-        }
-
-        intent.setDataAndType(apkUri, "application/vnd.android.package-archive")
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) // 对于从非 Activity 上下文启动安装是必需的
-
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            Log.e("InstallApk", "启动安装失败: ${e.message}", e)
-            Toast.makeText(this, "启动安装失败: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        // 如果注册了下载接收器且没有在下载完成时注销，确保在这里注销
-        // 但通常下载接收器应该在下载完成或失败后自行注销
-        // if (::downloadCompleteReceiver.isInitialized) { // 检查是否已初始化
-        //     try {
-        //         unregisterReceiver(downloadCompleteReceiver)
-        //     } catch (e: IllegalArgumentException) {
-        //         // Receiver not registered
-        //     }
-        // }
     }
 }
